@@ -7,6 +7,7 @@ the ODE process model and fault graph.
 """
 
 import sys
+from pubsub import pub
 from hardware import (
     Tank, SensorySystem, AirLine, GasExit,
     AntiFoamLine, BaseLine, AcidLine, SubstrateLine,
@@ -90,12 +91,20 @@ class TAS_SensorySystem:
     def read_environment(self):
         return self.sensor_system.read_all_sensors()
 
+    def execute(self):
+        """Pub/sub entry point: read sensors and publish raw data."""
+        raw = self.read_environment()
+        pub.sendMessage('sensory.data', raw=raw)
+
 
 class PresentationSystem:
     """
     Converts raw sensor data into a standard format
     understood by all TAS subsystems.
     """
+    def __init__(self):
+        self.time_h = 0.0  # injected by orchestrator each step
+
     def format_data(self, data):
         formatted = {
             "DO":          data["oxygen"],
@@ -106,11 +115,21 @@ class PresentationSystem:
         }
         return formatted
 
+    def on_sensory_data(self, raw):
+        """Pub/sub listener: format raw data and republish."""
+        formatted = self.format_data(raw)
+        formatted["time_h"] = self.time_h
+        pub.sendMessage('presentation.data', formatted=formatted)
+
 
 class ReasonSystem:
     """
     Checks the sensory data and updates nodes per sensor based on rules.
     """
+    def __init__(self):
+        self.system = None      # reactor reference, set by ThoughtSystem
+        self.intellect = None   # intellect reference, set by ThoughtSystem
+
     def evaluate(self, system, intellect):
         fault_graph.check_temperature(system)
         fault_graph.check_motor_speed(system)
@@ -120,10 +139,26 @@ class ReasonSystem:
         fault_graph.check_biomass(system, intellect)
         fault_graph.check_chamber_pressure(system)
 
+    def on_presentation_data(self, formatted):
+        """Pub/sub listener: evaluate fault graph and signal completion."""
+        self.evaluate(self.system, self.intellect)
+        pub.sendMessage('reason.evaluated')
+
 
 class DecisionSystem:
+    def __init__(self):
+        self.last_running = True
+        self.last_actions = []
+
     def decide(self) -> tuple[bool, list]:
         return fault_graph.decide()
+
+    def on_reason_evaluated(self):
+        """Pub/sub listener: decide actions and publish result."""
+        self.last_running, self.last_actions = self.decide()
+        pub.sendMessage('decision.result',
+                        running=self.last_running,
+                        actions=self.last_actions)
 
 
 class WillSystem:
@@ -134,6 +169,21 @@ class WillSystem:
         self.air_line = reactor.air_line
         self.substrate = reactor.substrate_line
         self.motor = reactor.tank.motor
+        self.last_actions_taken = []
+
+    def on_decision_result(self, running, actions):
+        """Pub/sub listener: execute physical actions from decision."""
+        self.last_actions_taken = []
+        for action in actions:
+            if action == "increase_airflow":
+                self.increase_airflow()
+                self.last_actions_taken.append("increase_airflow")
+            elif action == "reduce_feed":
+                self.reduce_feed()
+                self.last_actions_taken.append("reduce_feed")
+            elif action == "flag_sensor":
+                print("[WILL] Sensor flagged — continuing with caution.")
+                self.last_actions_taken.append("flag_sensor")
 
     def increase_airflow(self):
         print("[WILL] Opening air valve")
@@ -161,6 +211,10 @@ class IntellectSystem:
 
     def store(self, data):
         self.history.append(data)
+
+    def on_presentation_data(self, formatted):
+        """Pub/sub listener: store formatted data in history."""
+        self.store(formatted)
 
     def rate_of_change(self, variable: str, window: int = 3) -> float | None:
         """
@@ -213,6 +267,33 @@ def is_volume_limit_reached(system, limit=Tank.max_level * 0.9) -> bool:
 
 
 # ─────────────────────────────────────────────
+# ThoughtSystem — pub/sub orchestrator
+# ─────────────────────────────────────────────
+
+class ThoughtSystem:
+    """
+    Wires TAS subsystems via PyPubSub topics.
+    Subscription order on 'presentation.data' guarantees
+    IntellectSystem.store() runs before ReasonSystem.evaluate().
+    """
+
+    def __init__(self, reactor):
+        # Clear previous subscriptions (supports multiple scenarios in one process)
+        pub.unsubAll()
+
+        # Give Reason its references
+        reactor.reason.system = reactor
+        reactor.reason.intellect = reactor.intellect
+
+        # Wire subscriptions — ORDER MATTERS for presentation.data
+        pub.subscribe(reactor.presentation.on_sensory_data, 'sensory.data')
+        pub.subscribe(reactor.intellect.on_presentation_data, 'presentation.data')   # FIRST
+        pub.subscribe(reactor.reason.on_presentation_data, 'presentation.data')      # SECOND
+        pub.subscribe(reactor.decision.on_reason_evaluated, 'reason.evaluated')
+        pub.subscribe(reactor.will.on_decision_result, 'decision.result')
+
+
+# ─────────────────────────────────────────────
 # Unified Autonomous Bioreactor
 # ─────────────────────────────────────────────
 
@@ -261,6 +342,9 @@ class AutonomousBioreactor:
         self.will         = WillSystem(self)
         self.intellect    = IntellectSystem()
 
+        # Wire pub/sub communication between subsystems
+        self.thought = ThoughtSystem(self)
+
     # ── sensor proxies expected by fault_graph check functions ──
     @property
     def DO_sensor(self):
@@ -277,10 +361,14 @@ class AutonomousBioreactor:
         """
         Advance one timestep.
 
+        Triggers the pub/sub cascade:
+        Sensory → Presentation → Intellect + Reason → Decision → Will
+
         Returns
         -------
         (running, actions_taken)
         """
+        # 1. Advance ODE process model
         F          = feed_rate_from_speed(self.substrate_line.pump.speed, self.params)
         T          = self.tank.temperature.value
         motor_rpm  = self.tank.motor.rpm
@@ -288,32 +376,24 @@ class AutonomousBioreactor:
         self.process.step(dt_hours, F, T, motor_rpm, valve_open)
         self.process.update_sensors(self.tank)
 
-        raw_data  = self.sensory.read_environment()
-        formatted = self.presentation.format_data(raw_data)
-        formatted["time_h"] = self.process.time
-        self.intellect.store(formatted)
+        # 2. Inject time for Presentation formatting
+        self.presentation.time_h = self.process.time
 
+        # 3. Choose stdout context
         if verbose:
             ctx = _NullCtx()
         else:
             ctx = _SuppressInfo(self.log_file) if self.log_file else _NullCtx()
-        actions_taken = []
 
+        # 4. Fire the pub/sub cascade (synchronous — entire chain completes here)
         with ctx:
-            self.reason.evaluate(self, self.intellect)
-            running, actions = self.decision.decide()
+            self.sensory.execute()
 
-        for action in actions:
-            if action == "increase_airflow":
-                self.will.increase_airflow()
-                actions_taken.append("increase_airflow")
-            elif action == "reduce_feed":
-                self.will.reduce_feed()
-                actions_taken.append("reduce_feed")
-            elif action == "flag_sensor":
-                print("[WILL] Sensor flagged — continuing with caution.")
-                actions_taken.append("flag_sensor")
+        # 5. Read back results from the cascade
+        running       = self.decision.last_running
+        actions_taken = self.will.last_actions_taken
 
+        # 6. Healthy halt conditions
         if running:
             if is_plateaued(self.intellect):
                 print("\n[END] Biomass plateau detected. Run complete.")
